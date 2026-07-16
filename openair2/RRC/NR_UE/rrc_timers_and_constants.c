@@ -133,12 +133,13 @@ void handle_meas_timers(NR_UE_RRC_INST_t *rrc)
       // Handle Event A3 timer expiry
       bool ta3_expired = nr_timer_tick(&params->TA3);
       if (ta3_expired && params->trigger_quantity > 0) {
-        rrc_ue_generate_measurementReport(nb, rrc->ue_id, meas_id);
         params->reports_sent = 1;
-
-        if (params->reports_sent < params->max_reports && !nr_timer_is_active(&params->periodic_report_timer)) {
-          nr_timer_setup(&params->periodic_report_timer, params->report_interval_ms, 10);
-          nr_timer_start(&params->periodic_report_timer);
+        if (!nr_rrc_is_cho_cond_meas_id(nb, meas_id)) {
+          rrc_ue_generate_measurementReport(nb, rrc->ue_id, meas_id);
+          if (params->reports_sent < params->max_reports && !nr_timer_is_active(&params->periodic_report_timer)) {
+            nr_timer_setup(&params->periodic_report_timer, params->report_interval_ms, 10);
+            nr_timer_start(&params->periodic_report_timer);
+          }
         }
       }
 
