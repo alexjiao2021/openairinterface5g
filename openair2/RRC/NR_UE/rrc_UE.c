@@ -1114,6 +1114,97 @@ static bool nr_rrc_ue_process_masterCellGroup(NR_UE_RRC_INST_t *rrc,
   return true;
 }
 
+static void cho_candidate_free(cho_candidate_t *cand)
+{
+  if (!cand->active)
+    return;
+  if (cand->condRRCReconfig) {
+    ASN_STRUCT_FREE(asn_DEF_NR_RRCReconfiguration, cand->condRRCReconfig);
+    cand->condRRCReconfig = NULL;
+  }
+  memset(cand, 0, sizeof(*cand));
+}
+
+static void handle_cond_reconfig_remove(rrcPerNB_t *rrc, struct NR_CondReconfigToRemoveList_r16 *remove_list)
+{
+  for (int i = 0; i < remove_list->list.count; i++) {
+    long id = *remove_list->list.array[i];
+    for (int j = 0; j < MAX_CHO_CANDIDATES; j++) {
+      if (rrc->cho_candidates[j].active && rrc->cho_candidates[j].condReconfigId == id) {
+        LOG_I(NR_RRC, "CHO: removing candidate condReconfigId=%ld\n", id);
+        cho_candidate_free(&rrc->cho_candidates[j]);
+        break;
+      }
+    }
+  }
+}
+
+static void handle_cond_reconfig_addmod(rrcPerNB_t *rrc,
+                                        struct NR_CondReconfigToAddModList_r16 *addmod_list,
+                                        bool attempt_cond_reconfig)
+{
+  for (int i = 0; i < addmod_list->list.count; i++) {
+    NR_CondReconfigToAddMod_r16_t *entry = addmod_list->list.array[i];
+    long id = entry->condReconfigId_r16;
+
+    int slot = -1;
+    for (int j = 0; j < MAX_CHO_CANDIDATES; j++) {
+      if (rrc->cho_candidates[j].active && rrc->cho_candidates[j].condReconfigId == id) {
+        slot = j;
+        break;
+      }
+    }
+    if (slot < 0) {
+      for (int j = 0; j < MAX_CHO_CANDIDATES; j++) {
+        if (!rrc->cho_candidates[j].active) {
+          slot = j;
+          break;
+        }
+      }
+    }
+    if (slot < 0) {
+      LOG_E(NR_RRC, "CHO: no free candidate slot for condReconfigId=%ld\n", id);
+      continue;
+    }
+
+    cho_candidate_t *cand = &rrc->cho_candidates[slot];
+    if (cand->condRRCReconfig) {
+      ASN_STRUCT_FREE(asn_DEF_NR_RRCReconfiguration, cand->condRRCReconfig);
+      cand->condRRCReconfig = NULL;
+    }
+
+    if (entry->condRRCReconfig_r16) {
+      asn_dec_rval_t dec = uper_decode(NULL,
+                                       &asn_DEF_NR_RRCReconfiguration,
+                                       (void **)&cand->condRRCReconfig,
+                                       entry->condRRCReconfig_r16->buf,
+                                       entry->condRRCReconfig_r16->size,
+                                       0,
+                                       0);
+      if (dec.code != RC_OK) {
+        LOG_E(NR_RRC, "CHO: failed to decode condRRCReconfig for condReconfigId=%ld\n", id);
+        cand->condRRCReconfig = NULL;
+        continue;
+      }
+    }
+
+    cand->condExecutionCond_count = 0;
+    if (entry->condExecutionCond_r16) {
+      int count = entry->condExecutionCond_r16->list.count;
+      if (count > MAX_MEAS_ID)
+        count = MAX_MEAS_ID;
+      for (int k = 0; k < count; k++)
+        cand->condExecutionCond[k] = *entry->condExecutionCond_r16->list.array[k];
+      cand->condExecutionCond_count = count;
+    }
+
+    cand->condReconfigId = id;
+    cand->attempt_cond_reconfig = attempt_cond_reconfig;
+    cand->active = true;
+    LOG_I(NR_RRC, "CHO: stored candidate condReconfigId=%ld with %d execution condition(s)\n", id, cand->condExecutionCond_count);
+  }
+}
+
 static bool nr_rrc_process_reconfiguration_v1530(NR_UE_RRC_INST_t *rrc, NR_RRCReconfiguration_v1530_IEs_t *rec_1530, int gNB_index)
 {
   if (rec_1530->fullConfig) {
@@ -1197,6 +1288,25 @@ static bool nr_rrc_process_reconfiguration_v1530(NR_UE_RRC_INST_t *rrc, NR_RRCRe
           SEQUENCE_free(&asn_DEF_NR_RadioBearerConfig, RadioBearerConfig, 1);
         } else
           nr_rrc_ue_process_RadioBearerConfig(rrc, RadioBearerConfig);
+      }
+      NR_RRCReconfiguration_v1610_IEs_t *rec_1610 = rec_1560->nonCriticalExtension;
+      if (rec_1610 && rec_1610->conditionalReconfiguration_r16) {
+        NR_ConditionalReconfiguration_r16_t *condReconfig = rec_1610->conditionalReconfiguration_r16;
+        RRCLOG_I("RRCReconfiguration includes conditionalReconfiguration-r16\n");
+
+        rrcPerNB_t *rrcNB = rrc->perNB + gNB_index;
+
+        /* attemptCondReconfig: if present, flag the UE to re-evaluate CHO
+         * candidates on the first cell selection after a subsequent failure
+         * (TS 38.331 §5.3.7.3) */
+        bool attempt = (condReconfig->attemptCondReconfig_r16 != NULL);
+        rrc->cho_attempt_after_failure = attempt;
+
+        if (condReconfig->condReconfigToRemoveList_r16)
+          handle_cond_reconfig_remove(rrcNB, condReconfig->condReconfigToRemoveList_r16);
+
+        if (condReconfig->condReconfigToAddModList_r16)
+          handle_cond_reconfig_addmod(rrcNB, condReconfig->condReconfigToAddModList_r16, attempt);
       }
     }
   }
@@ -1997,6 +2107,20 @@ static int check_si_status(NR_UE_RRC_SI_INFO *SI_info)
   return 0;
 }
 
+static void nr_rrc_ue_generate_RRCReconfigurationComplete(NR_UE_RRC_INST_t *rrc, const int srb_id, const uint8_t Transaction_id)
+{
+  uint8_t buffer[32];
+  int size = do_NR_RRCReconfigurationComplete(buffer, sizeof(buffer), Transaction_id);
+  RRCLOG_I(" Logical Channel UL-DCCH (SRB1), Generating RRCReconfigurationComplete (bytes %d)\n", size);
+  AssertFatal(srb_id == 1 || srb_id == 3, "Invalid SRB ID %d\n", srb_id);
+  RRCLOG_D(
+      "RRC sent PDCP_DATA_REQ/%d Bytes (RRCReconfigurationComplete) "
+      "--->][PDCP][RB %02d]\n",
+      size,
+      srb_id);
+  nr_pdcp_data_req_srb(rrc->ue_id, srb_id, 0, size, buffer, deliver_pdu_srb_rlc, NULL);
+}
+
 /*brief decode BCCH-BCH (MIB) message*/
 static void nr_rrc_ue_decode_NR_BCCH_BCH_Message(NR_UE_RRC_INST_t *rrc,
                                                  const uint8_t gNB_index,
@@ -2036,6 +2160,64 @@ static void nr_rrc_ue_decode_NR_BCCH_BCH_Message(NR_UE_RRC_INST_t *rrc,
   // Actions following cell selection while T311 is running
   NR_UE_Timers_Constants_t *timers = &rrc->timers_and_constants;
   if (nr_timer_is_active(&timers->T311)) {
+    // TS 38.331 §5.3.7.3 — if attemptCondReconfig was received, check whether
+    // the newly-selected cell is a CHO target candidate. If so, apply the
+    // stored condRRCReconfig and skip the normal reestablishment path.
+    if (rrc->cho_attempt_after_failure) {
+      for (int nb = 0; nb < NB_CNX_UE; nb++) {
+        rrcPerNB_t *rrcNB = rrc->perNB + nb;
+        for (int i = 0; i < MAX_CHO_CANDIDATES; i++) {
+          cho_candidate_t *cand = &rrcNB->cho_candidates[i];
+          if (!cand->active || !cand->condRRCReconfig)
+            continue;
+          NR_RRCReconfiguration_t *rec = cand->condRRCReconfig;
+          if (rec->criticalExtensions.present != NR_RRCReconfiguration__criticalExtensions_PR_rrcReconfiguration)
+            continue;
+          NR_RRCReconfiguration_IEs_t *ie = rec->criticalExtensions.choice.rrcReconfiguration;
+          if (!ie->secondaryCellGroup && !ie->nonCriticalExtension)
+            continue;
+          NR_RRCReconfiguration_v1530_IEs_t *ie1530 = ie->nonCriticalExtension;
+          if (!ie1530 || !ie1530->masterCellGroup)
+            continue;
+          NR_CellGroupConfig_t *cgc = NULL;
+          asn_dec_rval_t dec = uper_decode(NULL,
+                                           &asn_DEF_NR_CellGroupConfig,
+                                           (void **)&cgc,
+                                           ie1530->masterCellGroup->buf,
+                                           ie1530->masterCellGroup->size,
+                                           0,
+                                           0);
+          if (dec.code != RC_OK || !cgc) {
+            ASN_STRUCT_FREE(asn_DEF_NR_CellGroupConfig, cgc);
+            continue;
+          }
+          bool target_matches = false;
+          if (cgc->spCellConfig && cgc->spCellConfig->reconfigurationWithSync
+              && cgc->spCellConfig->reconfigurationWithSync->spCellConfigCommon
+              && cgc->spCellConfig->reconfigurationWithSync->spCellConfigCommon->physCellId) {
+            target_matches = (*cgc->spCellConfig->reconfigurationWithSync->spCellConfigCommon->physCellId == phycellid);
+          }
+          ASN_STRUCT_FREE(asn_DEF_NR_CellGroupConfig, cgc);
+
+          if (!target_matches)
+            continue;
+
+          RRCLOG_I("CHO: selected cell PCI=%u matches candidate "
+                   "condReconfigId=%ld, executing CHO after failure\n",
+                   phycellid,
+                   cand->condReconfigId);
+          uint8_t transaction_id = cand->condRRCReconfig->rrc_TransactionIdentifier;
+          nr_rrc_ue_process_rrcReconfiguration(rrc, nb, cand->condRRCReconfig);
+          nr_rrc_ue_generate_RRCReconfigurationComplete(rrc, 1, transaction_id);
+          for (int j = 0; j < MAX_CHO_CANDIDATES; j++)
+            cho_candidate_free(&rrcNB->cho_candidates[j]);
+          rrc->cho_attempt_after_failure = false;
+          nr_timer_stop(&timers->T311);
+          return;
+        }
+      }
+    }
+
     nr_timer_stop(&timers->T311);
     rrc->ra_trigger = RRC_CONNECTION_REESTABLISHMENT;
 
@@ -2661,20 +2843,6 @@ static void nr_rrc_ue_process_securityModeCommand(NR_UE_RRC_INST_t *rrc,
   }
 }
 
-static void nr_rrc_ue_generate_RRCReconfigurationComplete(NR_UE_RRC_INST_t *rrc, const int srb_id, const uint8_t Transaction_id)
-{
-  uint8_t buffer[32];
-  int size = do_NR_RRCReconfigurationComplete(buffer, sizeof(buffer), Transaction_id);
-  RRCLOG_I(" Logical Channel UL-DCCH (SRB1), Generating RRCReconfigurationComplete (bytes %d)\n", size);
-  AssertFatal(srb_id == 1 || srb_id == 3, "Invalid SRB ID %d\n", srb_id);
-  RRCLOG_D(
-      "RRC sent PDCP_DATA_REQ/%d Bytes (RRCReconfigurationComplete) "
-      "--->][PDCP][RB %02d]\n",
-      size,
-      srb_id);
-  nr_pdcp_data_req_srb(rrc->ue_id, srb_id, 0, size, buffer, deliver_pdu_srb_rlc, NULL);
-}
-
 static void nr_rrc_ue_generate_rrcReestablishmentComplete(const NR_UE_RRC_INST_t *rrc,
                                                           const NR_RRCReestablishment_t *rrcReestablishment)
 {
@@ -3076,6 +3244,69 @@ static void handle_event_a2(l3_measurements_t *l3_measurements,
   }
 }
 
+// TS 38.331 - 5.5.4.4 / 5.3.5.13.4 shared A3 entry-condition evaluator
+// Handles both event A3 and condEventA3
+static void eval_a3_condition(l3_measurements_t *l3_measurements,
+                              rrcPerNB_t *rrcNB,
+                              int rsrp_offset,
+                              int rsrp_hysteresis,
+                              NR_TimeToTrigger_t time_to_trigger,
+                              NR_EventTriggerConfig_t *event_trigger_config,
+                              long rs_type,
+                              long report_config_id)
+{
+  int meas_id = get_meas_id(rrcNB, report_config_id);
+  if (meas_id < 0)
+    return;
+  meas_report_params_t *params = &l3_measurements->meas_report[meas_id];
+
+  int serving_cell_rsrp = get_rsrp_value(&l3_measurements->serving_cell);
+  if (serving_cell_rsrp == INT_MAX) {
+    LOG_D(NR_RRC, "There are no RSRP measurements taken for the serving cell\n");
+    return;
+  }
+
+  bool entry_cond_met = false;
+  bool above_leaving_threshold = false;
+  int entry_neighbor_rsrp = INT_MIN;
+
+  for (int i = 0; i < NUMBER_OF_NEIGHBORING_CELLS_MAX; i++) {
+    int neighboring_cell_rsrp = get_rsrp_value(&l3_measurements->neighboring_cell[i]);
+    if (neighboring_cell_rsrp == INT_MAX) {
+      LOG_D(NR_RRC, "There are no RSRP measurements taken for the neighboring cell %d\n", i);
+      neighboring_cell_rsrp = INT_MIN;
+    }
+
+    if (neighboring_cell_rsrp > serving_cell_rsrp + rsrp_offset + rsrp_hysteresis) {
+      entry_cond_met = true;
+      entry_neighbor_rsrp = neighboring_cell_rsrp;
+    }
+    if (neighboring_cell_rsrp >= serving_cell_rsrp + rsrp_offset - rsrp_hysteresis)
+      above_leaving_threshold = true;
+  }
+
+  if (entry_cond_met && !nr_timer_is_active(&params->TA3) && (params->reports_sent == 0)) {
+    nr_timer_setup(&params->TA3, get_event_time_to_trigger(time_to_trigger), 10);
+    nr_timer_start(&params->TA3);
+    if (event_trigger_config) {
+      setup_meas_trigger(l3_measurements, event_trigger_config, meas_id, NR_MeasTriggerQuantityOffset_PR_rsrp, true);
+    } else {
+      /* condTriggerConfig path: only set what handle_meas_timers checks to
+       * decide whether TA3 expiry counts as a fired condition. */
+      params->rs_type = rs_type;
+      params->trigger_quantity = NR_MeasTriggerQuantityOffset_PR_rsrp;
+    }
+    LOG_W(NR_RRC,
+          "(neighboring_cell_rsrp) %i > (serving_cell_rsrp %i) + (rsrp_offset) %i + (rsrp_hysteresis) %i\n",
+          entry_neighbor_rsrp,
+          serving_cell_rsrp,
+          rsrp_offset,
+          rsrp_hysteresis);
+  } else if (nr_timer_is_active(&params->TA3) && !above_leaving_threshold) {
+    stop_meas_event(params, &params->TA3);
+  }
+}
+
 // TS 38.331 - 5.5.4.4 Event A3 (Neighbour becomes offset better than SpCell)
 static void handle_event_a3(l3_measurements_t *l3_measurements,
                             rrcPerNB_t *rrcNB,
@@ -3085,69 +3316,74 @@ static void handle_event_a3(l3_measurements_t *l3_measurements,
 {
   if (event_A3->a3_Offset.present != NR_MeasTriggerQuantityOffset_PR_rsrp)
     return;
+  eval_a3_condition(l3_measurements,
+                    rrcNB,
+                    event_A3->a3_Offset.choice.rsrp >> 1,
+                    event_A3->hysteresis,
+                    event_A3->timeToTrigger,
+                    event_trigger_config,
+                    event_trigger_config->rsType,
+                    report_config_id);
+}
 
-  int meas_id = get_meas_id(rrcNB, report_config_id);
-  if (meas_id < 0)
+// TS 38.331 - 5.3.5.13.4 condEventA3
+static void handle_cond_event_a3(l3_measurements_t *l3_measurements,
+                                 rrcPerNB_t *rrcNB,
+                                 struct NR_CondTriggerConfig_r16__condEventId__condEventA3 *cond_A3,
+                                 long rs_type,
+                                 long report_config_id)
+{
+  if (cond_A3->a3_Offset.present != NR_MeasTriggerQuantityOffset_PR_rsrp)
     return;
-  meas_report_params_t *params = &l3_measurements->meas_report[meas_id];
-  meas_t *serving_cell = &l3_measurements->serving_cell;
+  eval_a3_condition(l3_measurements,
+                    rrcNB,
+                    cond_A3->a3_Offset.choice.rsrp >> 1,
+                    cond_A3->hysteresis,
+                    cond_A3->timeToTrigger,
+                    NULL,
+                    rs_type,
+                    report_config_id);
+}
 
-  int serving_cell_rsrp = get_rsrp_value(serving_cell);
-  if (serving_cell_rsrp == INT_MAX) {
-    LOG_D(NR_RRC, "There are no RSRP measurements taken for the serving cell\n");
-    return;
-  }
+static bool cho_check_condition_a3(l3_measurements_t *l3_measurements, rrcPerNB_t *rrcNB, long meas_id)
+{
+  if (meas_id <= 0 || meas_id >= MAX_MEAS_ID)
+    return false;
+  if (!rrcNB->MeasId[meas_id])
+    return false;
+  return l3_measurements->meas_report[meas_id].reports_sent >= 1;
+}
 
-  int rsrp_offset = event_A3->a3_Offset.choice.rsrp >> 1;
-  int rsrp_hysteresis = event_A3->hysteresis;
+// TS 38.331 §5.3.5.13.4 & 5.3.5.13.5 — evaluate all active CHO candidates and execute the
+// first one whose condExecutionCond (AND over all measIds) is satisfied.
+static void nr_rrc_ue_check_and_execute_cho(NR_UE_RRC_INST_t *rrc, const uint8_t gnb_index)
+{
+  rrcPerNB_t *rrcNB = rrc->perNB + gnb_index;
+  l3_measurements_t *l3_measurements = &rrcNB->l3_measurements;
 
-  // Check all neighboring cells for Event A3 condition
-  bool entry_cond_met = false;
-  bool above_leaving_threshold = false;
-  int entry_neighbor_rsrp = INT_MIN;
+  for (int i = 0; i < MAX_CHO_CANDIDATES; i++) {
+    cho_candidate_t *cand = &rrcNB->cho_candidates[i];
+    if (!cand->active || !cand->condRRCReconfig)
+      continue;
 
-  for (int i = 0; i < NUMBER_OF_NEIGHBORING_CELLS_MAX; i++) {
-    meas_t *neighboring_cell = &l3_measurements->neighboring_cell[i];
-    int neighboring_cell_rsrp = get_rsrp_value(neighboring_cell);
-
-    if (neighboring_cell_rsrp == INT_MAX) {
-      LOG_D(NR_RRC, "There are no RSRP measurements taken for the neighboring cell %d\n", i);
-      neighboring_cell_rsrp = INT_MIN;
+    bool all_met = (cand->condExecutionCond_count > 0);
+    for (int k = 0; k < cand->condExecutionCond_count && all_met; k++) {
+      if (!cho_check_condition_a3(l3_measurements, rrcNB, cand->condExecutionCond[k]))
+        all_met = false;
     }
+    if (!all_met)
+      continue;
 
-    // Check entry condition
-    if (neighboring_cell_rsrp > serving_cell_rsrp + rsrp_offset + rsrp_hysteresis) {
-      entry_cond_met = true;
-      entry_neighbor_rsrp = neighboring_cell_rsrp;
-    }
+    RRCLOG_I("CHO: execution condition satisfied for condReconfigId=%ld, applying condRRCReconfig\n", cand->condReconfigId);
 
-    // Check if any neighbor is still above leaving threshold
-    if (neighboring_cell_rsrp >= serving_cell_rsrp + rsrp_offset - rsrp_hysteresis) {
-      above_leaving_threshold = true;
-    }
-  }
+    uint8_t transaction_id = cand->condRRCReconfig->rrc_TransactionIdentifier;
+    nr_rrc_ue_process_rrcReconfiguration(rrc, gnb_index, cand->condRRCReconfig);
+    nr_rrc_ue_generate_RRCReconfigurationComplete(rrc, 1, transaction_id);
 
-  // Trigger event if any neighbor meets entry condition
-  if (entry_cond_met && !nr_timer_is_active(&params->TA3) && (params->reports_sent == 0)) {
-    start_meas_event(l3_measurements,
-                     rrcNB,
-                     &params->TA3,
-                     event_trigger_config,
-                     report_config_id,
-                     NR_MeasTriggerQuantityOffset_PR_rsrp,
-                     true,
-                     event_A3->timeToTrigger);
+    for (int j = 0; j < MAX_CHO_CANDIDATES; j++)
+      cho_candidate_free(&rrcNB->cho_candidates[j]);
 
-    LOG_W(NR_RRC,
-          "(neighboring_cell_rsrp) %i > (serving_cell_rsrp %i) + (rsrp_offset) %i + (rsrp_hysteresis) %i\n",
-          entry_neighbor_rsrp,
-          serving_cell_rsrp,
-          rsrp_offset,
-          rsrp_hysteresis);
-  }
-  // Stop event if all neighbors are below leaving threshold
-  else if (nr_timer_is_active(&params->TA3) && !above_leaving_threshold) {
-    stop_meas_event(params, &params->TA3);
+    break;
   }
 }
 
@@ -3165,30 +3401,39 @@ static void nr_ue_check_meas_report(NR_UE_RRC_INST_t *rrc, const uint8_t gnb_ind
       continue;
 
     NR_ReportConfigNR_t *report_config_nr = report_config->reportConfig.choice.reportConfigNR;
-    if (report_config_nr->reportType.present != NR_ReportConfigNR__reportType_PR_eventTriggered)
-      continue;
 
-    NR_EventTriggerConfig_t *event_trigger_config = report_config_nr->reportType.choice.eventTriggered;
-
-    switch (event_trigger_config->eventId.present) {
-      case NR_EventTriggerConfig__eventId_PR_eventA2:
-        handle_event_a2(l3_measurements,
-                        rrcNB,
-                        event_trigger_config->eventId.choice.eventA2,
-                        event_trigger_config,
-                        report_config->reportConfigId);
-        break;
-      case NR_EventTriggerConfig__eventId_PR_eventA3:
-        handle_event_a3(l3_measurements,
-                        rrcNB,
-                        event_trigger_config->eventId.choice.eventA3,
-                        event_trigger_config,
-                        report_config->reportConfigId);
-        break;
-      default:
-        break;
+    if (report_config_nr->reportType.present == NR_ReportConfigNR__reportType_PR_eventTriggered) {
+      NR_EventTriggerConfig_t *event_trigger_config = report_config_nr->reportType.choice.eventTriggered;
+      switch (event_trigger_config->eventId.present) {
+        case NR_EventTriggerConfig__eventId_PR_eventA2:
+          handle_event_a2(l3_measurements,
+                          rrcNB,
+                          event_trigger_config->eventId.choice.eventA2,
+                          event_trigger_config,
+                          report_config->reportConfigId);
+          break;
+        case NR_EventTriggerConfig__eventId_PR_eventA3:
+          handle_event_a3(l3_measurements,
+                          rrcNB,
+                          event_trigger_config->eventId.choice.eventA3,
+                          event_trigger_config,
+                          report_config->reportConfigId);
+          break;
+        default:
+          break;
+      }
+    } else if (report_config_nr->reportType.present == NR_ReportConfigNR__reportType_PR_condTriggerConfig_r16) {
+      NR_CondTriggerConfig_r16_t *ctc = report_config_nr->reportType.choice.condTriggerConfig_r16;
+      if (ctc->condEventId.present == NR_CondTriggerConfig_r16__condEventId_PR_condEventA3) {
+        handle_cond_event_a3(l3_measurements,
+                             rrcNB,
+                             ctc->condEventId.choice.condEventA3,
+                             ctc->rsType_r16,
+                             report_config->reportConfigId);
+      }
     }
   }
+  nr_rrc_ue_check_and_execute_cho(rrc, gnb_index);
 }
 
 static void nr_rrc_handle_ra_indication(NR_UE_RRC_INST_t *rrc, bool ra_succeeded, int gNB_index)
@@ -3849,6 +4094,24 @@ static uint32_t get_measid_freq(rrcPerNB_t *rrc, int meas_id)
   if (obj_nr->refFreqCSI_RS)
     return *obj_nr->refFreqCSI_RS;
   return 0;
+}
+
+// Returns true if the ReportConfig for this measId has reportType =
+// condTriggerConfig_r16
+bool nr_rrc_is_cho_cond_meas_id(rrcPerNB_t *nb, int meas_id)
+{
+  if (meas_id <= 0 || meas_id >= MAX_MEAS_ID)
+    return false;
+  NR_MeasIdToAddMod_t *mid = nb->MeasId[meas_id];
+  if (!mid)
+    return false;
+  NR_ReportConfigId_t rcid = mid->reportConfigId;
+  if (rcid <= 0 || rcid >= MAX_MEAS_CONFIG)
+    return false;
+  NR_ReportConfigToAddMod_t *rc = nb->ReportConfig[rcid];
+  if (!rc || rc->reportConfig.present != NR_ReportConfigToAddMod__reportConfig_PR_reportConfigNR)
+    return false;
+  return rc->reportConfig.choice.reportConfigNR->reportType.present == NR_ReportConfigNR__reportType_PR_condTriggerConfig_r16;
 }
 
 void rrc_ue_generate_measurementReport(rrcPerNB_t *rrc, instance_t ue_id, int meas_id)

@@ -36,6 +36,7 @@
 #include "NR_ReestablishmentCause.h"
 #include "NR_MeasurementReport.h"
 #include "NR_VarMeasReport.h"
+#include "NR_RRCReconfiguration.h"
 
 #include "RRC/NR/nr_rrc_common.h"
 #include "as_message.h"
@@ -49,6 +50,7 @@
 #define MAX_MEAS_ID 64
 #define MAX_QUANTITY_CONFIG 2
 #define NUMBER_OF_NEIGHBORING_CELLS_MAX 8
+#define MAX_CHO_CANDIDATES 8
 
 typedef enum {
   nr_SecondaryCellGroupConfig_r15=0,
@@ -171,6 +173,15 @@ typedef enum {
 
 typedef enum { RB_NOT_PRESENT, RB_ESTABLISHED, RB_SUSPENDED } NR_RB_status_t;
 
+typedef struct cho_candidate_s {
+  bool active;
+  long condReconfigId;
+  NR_RRCReconfiguration_t *condRRCReconfig;
+  long condExecutionCond[MAX_MEAS_ID];
+  int condExecutionCond_count;
+  bool attempt_cond_reconfig;
+} cho_candidate_t;
+
 typedef struct meas_report_params_s {
   long trigger_quantity;
   long rs_type;
@@ -203,6 +214,7 @@ typedef struct rrcPerNB {
   NR_UE_RRC_SI_INFO SInfo;
   NR_RSRP_Range_t s_measure;
   l3_measurements_t l3_measurements;
+  cho_candidate_t cho_candidates[MAX_CHO_CANDIDATES];
 } rrcPerNB_t;
 
 typedef struct NR_UE_RRC_INST_s {
@@ -264,6 +276,9 @@ typedef struct NR_UE_RRC_INST_s {
   notifiedFIFO_t *mac_input_nf;
   /* NAS PDU deferred until UL-DCCH exists: consumed in RRCSetupComplete/RRCResumeComplete dedicatedNAS-Message */
   as_nas_info_t pending_initial_nas;
+  /* set when attemptCondReconfig-r16 is received; triggers CHO execution on
+   * the first successful cell selection after a subsequent failure */
+  bool cho_attempt_after_failure;
 } NR_UE_RRC_INST_t;
 
 #define RRCLOG_D(f, ...) LOG_D(NR_RRC, "[UE %ld] RNTI 0x%04x " f, rrc->ue_id, rrc->rnti __VA_OPT__(, ) __VA_ARGS__)
