@@ -3986,6 +3986,39 @@ void nr_rrc_going_to_IDLE(NR_UE_RRC_INST_t *rrc,
     SI_info->SInfo_r17.sib19_validity = false;
     SI_info->SInfo_r17.sib20_validity = false;
     SI_info->SInfo_r17.sib21_validity = false;
+
+    // remove all entries within the MCG and SCG VarConditionalReconfig
+    for (int j = 0; j < MAX_CHO_CANDIDATES; j++)
+      cho_candidate_free(&nb->cho_candidates[j]);
+
+    // TS 38.331 §5.3.11: for each measId with condTriggerConfig, remove the
+    // associated reportConfig and the measObject, then remove the measId itself.
+    for (int j = 0; j < MAX_MEAS_ID; j++) {
+      if (!nb->MeasId[j])
+        continue;
+      if (!nr_rrc_is_cho_cond_meas_id(nb, j))
+        continue;
+      NR_ReportConfigId_t rcid = nb->MeasId[j]->reportConfigId;
+      NR_MeasObjectId_t moid = nb->MeasId[j]->measObjectId;
+      // Remove the condTriggerConfig reportConfig entry
+      if (rcid > 0 && rcid < MAX_MEAS_CONFIG) {
+        RRCLOG_I("removed reportConfigId %ld\n", rcid);
+        asn1cFreeStruc(asn_DEF_NR_ReportConfigToAddMod, nb->ReportConfig[rcid]);
+      }
+      bool shared = false;
+      for (int k = 0; k < MAX_MEAS_ID; k++) {
+        if (nb->MeasId[k] && nb->MeasId[k]->measObjectId == moid && !nr_rrc_is_cho_cond_meas_id(nb, k)) {
+          shared = true;
+          break;
+        }
+      }
+      if (!shared && moid > 0 && moid <= MAX_MEAS_OBJ) {
+        RRCLOG_I("removed measObjectId %ld\n", moid);
+        asn1cFreeStruc(asn_DEF_NR_MeasObjectToAddMod, nb->MeasObj[moid - 1]);
+      }
+      RRCLOG_I("removed measId %d\n", j);
+      asn1cFreeStruc(asn_DEF_NR_MeasIdToAddMod, nb->MeasId[j]);
+    }
   }
 
   if (rrc->nrRrcState == RRC_STATE_DETACH_NR) {
