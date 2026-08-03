@@ -960,6 +960,8 @@ static void nr_rrc_process_reconfigurationWithSync(NR_UE_RRC_INST_t *rrc,
   }
 
   l3_measurements_t *l3m = &rrcNB->l3_measurements;
+  nr_ue_meas_reset(&l3m->serving_cell, false);
+  nr_ue_meas_reset(&l3m->serving_cell, true);
   for (int i = 0; i < NUMBER_OF_NEIGHBORING_CELLS_MAX; i++) {
     nr_ue_meas_reset(&l3m->neighboring_cell[i], false);
     nr_ue_meas_reset(&l3m->neighboring_cell[i], true);
@@ -2012,7 +2014,10 @@ static void nr_rrc_ue_decode_NR_BCCH_BCH_Message(NR_UE_RRC_INST_t *rrc,
   if (rrc->phyCellID != phycellid || rrc->arfcn_ssb != ssb_arfcn) {
     RRCLOG_I("BCCH update: phyCellID %d->%u, arfcn_ssb %ld->%ld\n", rrc->phyCellID, phycellid, rrc->arfcn_ssb, ssb_arfcn);
   }
-  rrc->phyCellID = phycellid;
+  // For handover ignore MIBs from the source cell while T304 is running, PHY may still
+  // receive them before the RF switch to the target cell completes.
+  if (!nr_timer_is_active(&rrc->timers_and_constants.T304) || phycellid == rrc->phyCellID)
+    rrc->phyCellID = phycellid;
   rrc->arfcn_ssb = ssb_arfcn;
 
   asn_dec_rval_t dec_rval = uper_decode_complete(NULL,
@@ -3236,6 +3241,8 @@ static void nr_rrc_handle_meas_indication(NR_UE_RRC_INST_t *rrc, NRRrcMacMeasDat
   meas_t *meas_cell = NULL;
 
   if (meas_ind->is_neighboring_cell) {
+    if (meas_ind->Nid_cell == rrc->phyCellID)
+      return;
     uint16_t target_nid_cell = meas_ind->Nid_cell;
     for (int i = 0; i < NUMBER_OF_NEIGHBORING_CELLS_MAX; i++) {
       if (l3_measurements->neighboring_cell[i].Nid_cell == target_nid_cell) {
