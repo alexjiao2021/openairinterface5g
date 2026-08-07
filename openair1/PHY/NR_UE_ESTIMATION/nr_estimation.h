@@ -93,13 +93,22 @@ void nr_ue_ssb_rsrp_measurements(PHY_VARS_NR_UE *ue,
                                  const UE_nr_rxtx_proc_t *proc,
                                  const c16_t rxdataF[ue->frame_parms.nb_antennas_rx][ue->frame_parms.ofdm_symbol_size]);
 
+// One captured signal source for the neighboring-cell measurement
+typedef struct {
+  NR_DL_FRAME_PARMS *frame_parms; // frame_parms of the cell this capture came from
+  uint32_t ssb_arfcn;
+  int ru_id;
+  uint32_t rxdata_size;
+  c16_t *rxdata_ant;
+} nr_meas_source_t;
+
 // Structure to pass data to neighboring cell measurement task
 typedef struct {
   UE_nr_rxtx_proc_t proc;
   PHY_VARS_NR_UE *ue;
   int nb_ant;
-  uint32_t rxdata_size;
-  c16_t rxdata_ant[];
+  int num_sources;
+  nr_meas_source_t sources[];
 } nr_meas_task_args_t;
 
 void nr_ue_meas_neighboring_cell(void *arg);

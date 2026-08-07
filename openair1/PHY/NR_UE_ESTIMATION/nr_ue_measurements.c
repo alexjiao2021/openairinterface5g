@@ -458,10 +458,14 @@ static void handle_blind_search(fapi_nr_neighboring_cell_t *nr_neighboring_cell,
   }
 }
 
-static void search_new_neighboring_cell(UE_nr_rxtx_proc_t *proc, PHY_VARS_NR_UE *ue, c16_t **rxdata, uint32_t rxdata_size)
+static void search_new_neighboring_cell(UE_nr_rxtx_proc_t *proc,
+                                        PHY_VARS_NR_UE *ue,
+                                        NR_DL_FRAME_PARMS *frame_parms,
+                                        uint32_t source_ssb_arfcn,
+                                        c16_t **rxdata,
+                                        uint32_t rxdata_size)
 {
   // Generate PSS time-domain sequences once for all neighbor cells
-  NR_DL_FRAME_PARMS *frame_parms = &ue->frame_parms;
   __attribute__((aligned(32))) c16_t pssTime[NUMBER_PSS_SEQUENCE][frame_parms->ofdm_symbol_size];
   for (int nid2_idx = 0; nid2_idx < NUMBER_PSS_SEQUENCE; nid2_idx++) {
     generate_pss_nr_time(frame_parms->ofdm_symbol_size,
@@ -473,11 +477,11 @@ static void search_new_neighboring_cell(UE_nr_rxtx_proc_t *proc, PHY_VARS_NR_UE 
 
   // Build list of already discovered PCIs (serving cell + neighbor cells) for exclusion during blind search
   uint16_t exclude_nid_cells[NUMBER_OF_NEIGHBORING_CELLS_MAX + 1];
-  exclude_nid_cells[0] = frame_parms->Nid_cell;
+  exclude_nid_cells[0] = ue->frame_parms.Nid_cell;
   int num_exclude_nid_cells = 1;
   for (int i = 0; i < NUMBER_OF_NEIGHBORING_CELLS_MAX; i++) {
     fapi_nr_neighboring_cell_t *cell = &ue->nrUE_config.meas_config.nr_neighboring_cell[i];
-    if (cell->active && cell->Nid_cell != (uint16_t)-1 && cell->Nid_cell != frame_parms->Nid_cell) {
+    if (cell->active && cell->Nid_cell != (uint16_t)-1 && cell->Nid_cell != ue->frame_parms.Nid_cell) {
       exclude_nid_cells[num_exclude_nid_cells++] = cell->Nid_cell;
     }
   }
@@ -488,6 +492,9 @@ static void search_new_neighboring_cell(UE_nr_rxtx_proc_t *proc, PHY_VARS_NR_UE 
   for (int cell_idx = 0; cell_idx < NUMBER_OF_NEIGHBORING_CELLS_MAX; cell_idx++) {
     fapi_nr_neighboring_cell_t *neighbor_cell = &ue->nrUE_config.meas_config.nr_neighboring_cell[cell_idx];
     if (neighbor_cell->active == 0 || neighbor_cell->Nid_cell != (uint16_t)-1) {
+      continue;
+    }
+    if (neighbor_cell->ssb_freq != 0 ? neighbor_cell->ssb_freq != source_ssb_arfcn : frame_parms != &ue->frame_parms) {
       continue;
     }
 
@@ -513,10 +520,14 @@ static void search_new_neighboring_cell(UE_nr_rxtx_proc_t *proc, PHY_VARS_NR_UE 
   }
 }
 
-static void do_neighboring_cell_measurements(UE_nr_rxtx_proc_t *proc, PHY_VARS_NR_UE *ue, c16_t **rxdata)
+static void do_neighboring_cell_measurements(UE_nr_rxtx_proc_t *proc,
+                                             PHY_VARS_NR_UE *ue,
+                                             NR_DL_FRAME_PARMS *frame_parms,
+                                             uint32_t source_ssb_arfcn,
+                                             int source_ru_id,
+                                             c16_t **rxdata)
 {
   // Generate PSS time-domain sequences once for all neighbor cells
-  NR_DL_FRAME_PARMS *frame_parms = &ue->frame_parms;
   __attribute__((aligned(32))) c16_t pssTime[NUMBER_PSS_SEQUENCE][frame_parms->ofdm_symbol_size];
   for (int nid2_idx = 0; nid2_idx < NUMBER_PSS_SEQUENCE; nid2_idx++) {
     generate_pss_nr_time(frame_parms->ofdm_symbol_size,
@@ -531,7 +542,10 @@ static void do_neighboring_cell_measurements(UE_nr_rxtx_proc_t *proc, PHY_VARS_N
 
   for (int cell_idx = 0; cell_idx < NUMBER_OF_NEIGHBORING_CELLS_MAX; cell_idx++) {
     fapi_nr_neighboring_cell_t *neighbor_cell = &ue->nrUE_config.meas_config.nr_neighboring_cell[cell_idx];
-    if (neighbor_cell->active == 0 || neighbor_cell->Nid_cell == (uint16_t)-1 || neighbor_cell->Nid_cell == frame_parms->Nid_cell) {
+    if (neighbor_cell->active == 0 || neighbor_cell->Nid_cell == (uint16_t)-1 || neighbor_cell->Nid_cell == ue->frame_parms.Nid_cell) {
+      continue;
+    }
+    if (neighbor_cell->ssb_freq != 0 ? neighbor_cell->ssb_freq != source_ssb_arfcn : frame_parms != &ue->frame_parms) {
       continue;
     }
 
@@ -561,10 +575,9 @@ static void do_neighboring_cell_measurements(UE_nr_rxtx_proc_t *proc, PHY_VARS_N
     uint8_t sss_symbol = SSS_SYMBOL_NB - PSS_SYMBOL_NB;
     neighboring_cell_info->ssb_rsrp = nr_ue_calculate_ssb_rsrp(frame_parms, rxdataF[sss_symbol], frame_parms->ssb_start_subcarrier);
 
-    neighboring_cell_info->ssb_rsrp_dBm =
-        10 * log10(neighboring_cell_info->ssb_rsrp) + 30 - SQ15_SQUARED_NORM_FACTOR_DB
-        - ((int)openair0_cfg_g[ue->rf_map.card].rx_gain[0] - (int)openair0_cfg_g[ue->rf_map.card].rx_gain_offset[0])
-        - dB_fixed(ue->frame_parms.ofdm_symbol_size);
+    neighboring_cell_info->ssb_rsrp_dBm = 10 * log10(neighboring_cell_info->ssb_rsrp) + 30 - SQ15_SQUARED_NORM_FACTOR_DB
+        - ((int)openair0_cfg_g[source_ru_id].rx_gain[0] - (int)openair0_cfg_g[source_ru_id].rx_gain_offset[0])
+        - dB_fixed(frame_parms->ofdm_symbol_size);
 
     // Send SS measurements to RRC directly
     send_neighbor_cell_meas(ue, proc, neighbor_cell->Nid_cell, neighboring_cell_info->ssb_rsrp_dBm);
@@ -575,9 +588,13 @@ void nr_ue_meas_neighboring_cell(void *arg)
 {
   nr_meas_task_args_t *args = (nr_meas_task_args_t *)arg;
   c16_t *rx[args->nb_ant];
-  for (int i = 0; i < args->nb_ant; i++)
-    rx[i] = args->rxdata_ant + i * args->rxdata_size;
-  do_neighboring_cell_measurements(&args->proc, args->ue, rx);
+  for (int s = 0; s < args->num_sources; s++) {
+    nr_meas_source_t *src = &args->sources[s];
+    for (int i = 0; i < args->nb_ant; i++)
+      rx[i] = src->rxdata_ant + i * src->rxdata_size;
+    do_neighboring_cell_measurements(&args->proc, args->ue, src->frame_parms, src->ssb_arfcn, src->ru_id, rx);
+    free(src->rxdata_ant);
+  }
 
   args->ue->measurements.meas_request_pending = false;
   free(args);
@@ -587,9 +604,13 @@ void nr_ue_search_new_neighboring_cell(void *arg)
 {
   nr_meas_task_args_t *args = (nr_meas_task_args_t *)arg;
   c16_t *rx[args->nb_ant];
-  for (int i = 0; i < args->nb_ant; i++)
-    rx[i] = args->rxdata_ant + i * args->rxdata_size;
-  search_new_neighboring_cell(&args->proc, args->ue, rx, args->rxdata_size);
+  for (int s = 0; s < args->num_sources; s++) {
+    nr_meas_source_t *src = &args->sources[s];
+    for (int i = 0; i < args->nb_ant; i++)
+      rx[i] = src->rxdata_ant + i * src->rxdata_size;
+    search_new_neighboring_cell(&args->proc, args->ue, src->frame_parms, src->ssb_arfcn, rx, src->rxdata_size);
+    free(src->rxdata_ant);
+  }
 
   args->ue->measurements.search_new_cells_pending = false;
   free(args);

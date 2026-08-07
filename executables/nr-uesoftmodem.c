@@ -380,8 +380,12 @@ int main(int argc, char **argv)
     nrue_set_ru_cell_id(ru_id, cell_id);
 
     set_fp_options(cell_id, ru_id);
-    if (IS_SA_MODE(get_softmodem_params()) || get_softmodem_params()->sl_mode)
-      nr_init_frame_parms_ue_sa(nrue_get_cell_fp(cell_id), nrue_get_cell(cell_id));
+    if (IS_SA_MODE(get_softmodem_params()) || get_softmodem_params()->sl_mode) {
+      NR_DL_FRAME_PARMS *cell_fp = nrue_get_cell_fp(cell_id);
+      nr_init_frame_parms_ue_sa(cell_fp, nrue_get_cell(cell_id));
+      init_symbol_rotation(cell_fp);
+      init_timeshift_rotation(cell_fp->ofdm_symbol_size, cell_fp->nb_prefix_samples, cell_fp->ofdm_offset_divisor, cell_fp->timeshift_symbol_rotation);
+    }
   }
 
   int cell_id = 0;
@@ -479,6 +483,9 @@ int main(int argc, char **argv)
   threadCreate(&ru_start_thread, nrue_ru_start_thread, NULL, "ru_start_thread", -1, OAI_PRIORITY_RT_MAX);
   int ret = pthread_join(ru_start_thread, NULL);
   AssertFatal(ret == 0, "pthread_join error %d, errno %d (%s)\n", ret, errno, strerror(errno));
+
+  // RU/cell assignment is finalised now
+  init_ru_candidates_cache();
 
   for (int inst = 0; inst < NB_UE_INST; inst++) {
     LOG_I(PHY,"Intializing UE Threads for instance %d ...\n", inst);
