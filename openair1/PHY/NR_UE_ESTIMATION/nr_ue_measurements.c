@@ -310,7 +310,7 @@ static bool search_neighboring_cell(UE_nr_rxtx_proc_t *proc,
         }
       }
     }
-    cell_detected = metric > NR_PBCH_DMRS_METRIC_FLOOR ? true : false;
+    cell_detected = metric > (IS_SOFTMODEM_RFSIM ? 1e10 : NR_PBCH_DMRS_METRIC_FLOOR) ? true : false;
   }
 
   if (cell_detected) {
