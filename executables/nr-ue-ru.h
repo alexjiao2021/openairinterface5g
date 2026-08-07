@@ -16,6 +16,7 @@ void nrue_set_cell_params(configmodule_interface_t *cfg);
 int nrue_get_band(const PHY_VARS_NR_UE *UE);
 int nrue_get_ru_count(void);
 const nrUE_RU_params_t *nrue_get_ru(int ru_id);
+void nrue_set_cell_used_by_ue(int cell_id, int ue_id);
 void nrue_set_ru_cell_id(int ru_id, int cell_id);
 void nrue_set_ru_params(configmodule_interface_t *cfg);
 
@@ -30,5 +31,12 @@ int nrue_ru_read(PHY_VARS_NR_UE *UE, openair0_timestamp_t *ptimestamp, void **bu
 int nrue_ru_write(PHY_VARS_NR_UE *UE, openair0_timestamp_t timestamp, void **buff, int nsamps, int num_antennas, int flags);
 int nrue_ru_write_reorder(PHY_VARS_NR_UE *UE, openair0_timestamp_t timestamp, void **txp, int nsamps, int nbAnt, int flags);
 void nrue_ru_write_reorder_clear_context(PHY_VARS_NR_UE *UE);
+
+c16_t **nrue_get_neighbor_rxdata(int ru_id);
+uint32_t nrue_get_neighbor_rxdata_size(int ru_id);
+uint32_t nrue_get_neighbor_write_pos(int ru_id);
+bool nrue_is_neighbor_buf_filled(int ru_id);
+void nrue_is_neighbor_tracking(int ru_id, bool active);
+int32_t nrue_get_ru_ts_delta(int ru_id_a, int ru_id_b);
 
 #endif
