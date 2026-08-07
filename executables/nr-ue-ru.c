@@ -5,6 +5,7 @@
 #include "nr-ue-ru.h"
 #include "nr-uesoftmodem.h"
 #include "PHY/NR_UE_TRANSPORT/nr_transport_proto_ue.h"
+#include "PHY/NR_REFSIG/ss_pbch_nr.h"
 #include "common/config/config_paramdesc.h"
 #include "common/config/config_userapi.h"
 #include "openair1/PHY/phy_extern_nr_ue.h"
@@ -87,6 +88,19 @@ static NR_DL_FRAME_PARMS *nrue_cell_fp;
 
 static int nrue_ru_count;
 static nrUE_RU_params_t *nrue_rus;
+
+// Per-RU ring buffers for neighbor cell measurements
+typedef struct {
+  c16_t **rxdata;
+  uint32_t rxdata_size;
+  uint32_t write_pos;
+  int nb_antennas_rx;
+  bool initialized;
+  bool filled;
+  bool tracking_active;
+} nrue_neighbor_buf_t;
+
+static nrue_neighbor_buf_t *nrue_neighbor_bufs;
 
 openair0_config_t openair0_cfg_g[MAX_CARDS] = {};
 static openair0_device_t openair0_dev[MAX_CARDS] = {};
@@ -179,6 +193,12 @@ const nrUE_RU_params_t *nrue_get_ru(int ru_id)
 {
   AssertFatal(ru_id >= 0 && ru_id < nrue_ru_count, "Invalid RU ID %d! RU count = %d\n", ru_id, nrue_ru_count);
   return &nrue_rus[ru_id];
+}
+
+void nrue_set_cell_used_by_ue(int cell_id, int ue_id)
+{
+  AssertFatal(cell_id >= 0 && cell_id < nrue_cell_count, "Invalid cell ID %d\n", cell_id);
+  nrue_cells[cell_id].used_by_ue = ue_id;
 }
 
 void nrue_set_ru_cell_id(int ru_id, int cell_id)
@@ -330,10 +350,27 @@ void nrue_init_openair0(void)
     cfg->time_source = nrue_rus[ru_id].time_source;
     cfg->tune_offset = nrue_rus[ru_id].tune_offset;
   }
+
+  // Neighbor-cell measurement assumes every configured cell runs at the same sample rate,
+  // so timestamps and sample counts are directly comparable across RUs without resampling
+  double ref_sample_rate = 0;
+  for (int ru_id = 0; ru_id < nrue_ru_count; ru_id++) {
+    if (nrue_rus[ru_id].used_by_cell < 0)
+      continue;
+    if (ref_sample_rate == 0)
+      ref_sample_rate = openair0_cfg_g[ru_id].sample_rate;
+    AssertFatal(openair0_cfg_g[ru_id].sample_rate == ref_sample_rate,
+                "RU %d has sample_rate %f, expected %f: all configured cells must use the same sample rate\n",
+                ru_id,
+                openair0_cfg_g[ru_id].sample_rate,
+                ref_sample_rate);
+  }
 }
 
 void nrue_ru_start(void)
 {
+  nrue_neighbor_bufs = calloc_or_fail(MAX_CARDS, sizeof(nrue_neighbor_buf_t));
+
   for (int ru_id = 0; ru_id < nrue_ru_count; ru_id++) {
     openair0_config_t *cfg = &openair0_cfg_g[ru_id];
     openair0_device_t *dev = &openair0_dev[ru_id];
@@ -345,6 +382,24 @@ void nrue_ru_start(void)
     AssertFatal(tmp2 == 0, "Could not start the device %d\n", ru_id);
     if (usrp_tx_thread == 1)
       dev->trx_write_init(dev);
+
+    // Pre-allocate neighbor ring buffers for every RU
+    int cell_id = nrue_rus[ru_id].used_by_cell;
+    if (cell_id >= 0) {
+      NR_DL_FRAME_PARMS *fp = nrue_get_cell_fp(cell_id);
+      int nb_rx = cfg->rx_num_channels;
+      uint32_t capture_size = fp->samples_per_slot_wCP + NR_N_SYMBOLS_SSB * (fp->ofdm_symbol_size + fp->nb_prefix_samples);
+      // margin considering ts_delta between RUs
+      uint32_t buf_size = 2 * capture_size;
+      nrue_neighbor_bufs[ru_id].rxdata = malloc_or_fail(nb_rx * sizeof(c16_t *));
+      for (int a = 0; a < nb_rx; a++)
+        nrue_neighbor_bufs[ru_id].rxdata[a] = calloc_or_fail(buf_size, sizeof(c16_t));
+      nrue_neighbor_bufs[ru_id].rxdata_size = buf_size;
+      nrue_neighbor_bufs[ru_id].nb_antennas_rx = nb_rx;
+      nrue_neighbor_bufs[ru_id].write_pos = 0;
+      nrue_neighbor_bufs[ru_id].initialized = true;
+      LOG_D(PHY, "RU %d: allocated neighbor ring buffer %u samples for %d antennas\n", ru_id, buf_size, nb_rx);
+    }
   }
 }
 
@@ -428,6 +483,52 @@ int nrue_ru_adjust_rx_gain(PHY_VARS_NR_UE *UE, int gain_change)
   return gain_change;
 }
 
+c16_t **nrue_get_neighbor_rxdata(int ru_id)
+{
+  if (!nrue_neighbor_bufs || ru_id < 0 || ru_id >= MAX_CARDS)
+    return NULL;
+  if (!nrue_neighbor_bufs[ru_id].initialized)
+    return NULL;
+  return nrue_neighbor_bufs[ru_id].rxdata;
+}
+
+uint32_t nrue_get_neighbor_rxdata_size(int ru_id)
+{
+  if (!nrue_neighbor_bufs || ru_id < 0 || ru_id >= MAX_CARDS)
+    return 0;
+  return nrue_neighbor_bufs[ru_id].rxdata_size;
+}
+
+uint32_t nrue_get_neighbor_write_pos(int ru_id)
+{
+  if (!nrue_neighbor_bufs || ru_id < 0 || ru_id >= MAX_CARDS)
+    return 0;
+  return nrue_neighbor_bufs[ru_id].write_pos;
+}
+
+bool nrue_is_neighbor_buf_filled(int ru_id)
+{
+  if (!nrue_neighbor_bufs || ru_id < 0 || ru_id >= MAX_CARDS)
+    return false;
+  return nrue_neighbor_bufs[ru_id].filled;
+}
+
+void nrue_is_neighbor_tracking(int ru_id, bool active)
+{
+  if (!nrue_neighbor_bufs || ru_id < 0 || ru_id >= MAX_CARDS)
+    return;
+  nrue_neighbor_bufs[ru_id].tracking_active = active;
+}
+
+int32_t nrue_get_ru_ts_delta(int ru_id_a, int ru_id_b)
+{
+  if (ru_id_a < 0 || ru_id_a >= MAX_CARDS || ru_id_b < 0 || ru_id_b >= MAX_CARDS)
+    return 0;
+  if (!openair0_dev[ru_id_a].firstTS_initialized || !openair0_dev[ru_id_b].firstTS_initialized)
+    return 0;
+  return (int32_t)(openair0_dev[ru_id_b].firstTS - openair0_dev[ru_id_a].firstTS);
+}
+
 int nrue_ru_read(PHY_VARS_NR_UE *UE, openair0_timestamp_t *ptimestamp, void **buff, int nsamps, int num_antennas)
 {
   openair0_device_t *dev = &openair0_dev[UE->rf_map.card];
@@ -444,11 +545,6 @@ int nrue_ru_read(PHY_VARS_NR_UE *UE, openair0_timestamp_t *ptimestamp, void **bu
 
   // UE 0 needs to read from all RUs that are not used by any other UE
 
-  void *tmp_buf[num_antennas];
-  uint32_t tmp_samples[nsamps];
-  for (int ant = 0; ant < num_antennas; ant++)
-    tmp_buf[ant] = tmp_samples;
-
   for (int ru_id = 0; ru_id < nrue_ru_count; ru_id++) {
     int cell_id = nrue_rus[ru_id].used_by_cell;
     if (cell_id < 0) // skip RUs that have no cell definition
@@ -457,8 +553,41 @@ int nrue_ru_read(PHY_VARS_NR_UE *UE, openair0_timestamp_t *ptimestamp, void **bu
     if (ue_id >= 0) // skip cells that are already used by an UE
       continue;
 
+    nrue_neighbor_buf_t *nbuf = &nrue_neighbor_bufs[ru_id];
     dev = &openair0_dev[ru_id];
-    dev->trx_read_func(dev, &tmp_timestamp, tmp_buf, nsamps, num_antennas);
+
+    if (nbuf->initialized && nbuf->tracking_active) {
+      void *ring_buf[nbuf->nb_antennas_rx];
+      uint32_t pos = nbuf->write_pos;
+      uint32_t space_to_end = nbuf->rxdata_size - pos;
+
+      if ((uint32_t)nsamps <= space_to_end) {
+        for (int a = 0; a < nbuf->nb_antennas_rx; a++)
+          ring_buf[a] = &nbuf->rxdata[a][pos];
+        dev->trx_read_func(dev, &tmp_timestamp, ring_buf, nsamps, nbuf->nb_antennas_rx);
+      } else {
+        // Wrap: read into temporary per-antenna buffers then copy in two parts
+        c16_t *tmp[nbuf->nb_antennas_rx];
+        for (int a = 0; a < nbuf->nb_antennas_rx; a++)
+          tmp[a] = malloc_or_fail(nsamps * sizeof(c16_t));
+        dev->trx_read_func(dev, &tmp_timestamp, (void **)tmp, nsamps, nbuf->nb_antennas_rx);
+        for (int a = 0; a < nbuf->nb_antennas_rx; a++) {
+          memcpy(&nbuf->rxdata[a][pos], tmp[a], space_to_end * sizeof(c16_t));
+          memcpy(&nbuf->rxdata[a][0], tmp[a] + space_to_end, (nsamps - space_to_end) * sizeof(c16_t));
+          free(tmp[a]);
+        }
+      }
+      nbuf->write_pos = (pos + nsamps) % nbuf->rxdata_size;
+      if (nbuf->write_pos < pos) // wrapped: the whole buffer has now been written at least once
+        nbuf->filled = true;
+    } else {
+      void *tmp_buf[num_antennas];
+      uint32_t tmp_samples[nsamps];
+      for (int ant = 0; ant < num_antennas; ant++)
+        tmp_buf[ant] = tmp_samples;
+      dev->trx_read_func(dev, &tmp_timestamp, tmp_buf, nsamps, num_antennas);
+    }
+
     if (!dev->firstTS_initialized) {
       dev->firstTS = tmp_timestamp;
       dev->firstTS_initialized = true;

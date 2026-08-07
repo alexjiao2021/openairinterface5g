@@ -23,6 +23,7 @@
 #include "PHY/NR_UE_ESTIMATION/nr_estimation.h"
 #include "executables/softmodem-common.h"
 #include "executables/nr-uesoftmodem.h"
+#include "executables/nr-ue-ru.h"
 #include "SCHED_NR_UE/pucch_uci_ue_nr.h"
 #include <openair1/PHY/TOOLS/phy_scope_interface.h>
 #include "nfapi/open-nFAPI/nfapi/public_inc/nfapi_nr_interface.h"
@@ -738,26 +739,80 @@ static void nr_ue_dlsch_procedures(PHY_VARS_NR_UE *ue,
     memcpy(ue->phy_sim_dlsch_b, output, sizeof(output));
 }
 
+static bool has_neighbor_on_arfcn(PHY_VARS_NR_UE *ue, uint32_t ssb_arfcn)
+{
+  uint32_t serving_arfcn = get_ssb_arfcn(&ue->frame_parms);
+  for (int cell_idx = 0; cell_idx < NUMBER_OF_NEIGHBORING_CELLS_MAX; cell_idx++) {
+    const fapi_nr_neighboring_cell_t *cell = &ue->nrUE_config.meas_config.nr_neighboring_cell[cell_idx];
+    if (cell->active == 0)
+      continue;
+    if (cell->ssb_freq == 0 ? ssb_arfcn == serving_arfcn : cell->ssb_freq == ssb_arfcn)
+      return true;
+  }
+  return false;
+}
+
+typedef struct {
+  int ru_id;
+  int cell_id;
+  uint32_t ssb_arfcn;
+} nrue_ru_candidate_t;
+static nrue_ru_candidate_t ru_candidates[MAX_CARDS];
+static int num_ru_candidates = -1; // -1 = not yet built
+
+void init_ru_candidates_cache(void)
+{
+  num_ru_candidates = 0;
+  for (int ru_id = 0; ru_id < nrue_get_ru_count(); ru_id++) {
+    int cell_id = nrue_get_ru(ru_id)->used_by_cell;
+    if (cell_id < 0)
+      continue;
+    if (!nrue_get_neighbor_rxdata(ru_id)) // ring buffer not initialised
+      continue;
+    ru_candidates[num_ru_candidates++] =
+        (nrue_ru_candidate_t){.ru_id = ru_id, .cell_id = cell_id, .ssb_arfcn = get_ssb_arfcn(nrue_get_cell_fp(cell_id))};
+  }
+}
+
+// Fills source_ru_ids[] with every measurement source that has at least one matching configured
+// neighbor: -1 for the serving cell's own buffer, or a spare RU id.
+static int find_meas_sources(PHY_VARS_NR_UE *ue, int source_ru_ids[1 + MAX_CARDS])
+{
+  AssertFatal(num_ru_candidates >= 0, "RU candidates cache not initialized!\n");
+
+  int num_sources = 0;
+  uint32_t serving_arfcn = get_ssb_arfcn(&ue->frame_parms);
+  bool has_ru_on_serving_arfcn = false;
+  for (int i = 0; i < num_ru_candidates; i++) {
+    const nrue_ru_candidate_t *c = &ru_candidates[i];
+    bool has_neighbor = has_neighbor_on_arfcn(ue, c->ssb_arfcn);
+    nrue_is_neighbor_tracking(c->ru_id, has_neighbor);
+    if (c->ru_id == ue->rf_map.card)
+      continue;
+    if (nrue_get_cell(c->cell_id)->used_by_ue >= 0) // cell is already serving another UE
+      continue;
+    if (!nrue_is_neighbor_buf_filled(c->ru_id)) // buffer not yet filled with real captures
+      continue;
+    if (c->ssb_arfcn == serving_arfcn)
+      has_ru_on_serving_arfcn = true;
+    if (!has_neighbor)
+      continue;
+    source_ru_ids[num_sources++] = c->ru_id;
+  }
+  // Only fall back to the serving cell's own buffer when no spare RU already covers that frequency
+  if (!has_ru_on_serving_arfcn && has_neighbor_on_arfcn(ue, serving_arfcn))
+    source_ru_ids[num_sources++] = -1;
+  return num_sources;
+}
+
 static bool check_neighboring_cells_task(PHY_VARS_NR_UE *ue, bool task_pending)
 {
   if (task_pending == true) {
     return false;
   }
 
-  // Check if any intra-frequency neighbor cells are configured
-  uint32_t serving_ssb_freq = get_ssb_arfcn(&ue->frame_parms);
-  bool has_intra_freq_neighbors = false;
-
-  for (int cell_idx = 0; cell_idx < NUMBER_OF_NEIGHBORING_CELLS_MAX; cell_idx++) {
-    fapi_nr_neighboring_cell_t *nr_neighboring_cell = &ue->nrUE_config.meas_config.nr_neighboring_cell[cell_idx];
-    if (nr_neighboring_cell->active == 1) {
-      if (nr_neighboring_cell->ssb_freq == 0 || nr_neighboring_cell->ssb_freq == serving_ssb_freq) {
-        has_intra_freq_neighbors = true;
-      }
-    }
-  }
-
-  return has_intra_freq_neighbors;
+  int source_ru_ids[1 + MAX_CARDS];
+  return find_meas_sources(ue, source_ru_ids) > 0;
 }
 
 static bool is_ssb_index_transmitted(const PHY_VARS_NR_UE *ue, const int index)
@@ -1038,22 +1093,71 @@ static int pbch_process(PHY_VARS_NR_UE *UE,
   return sampleShift;
 }
 
+// Copies the already-captured samples for one measurement source into dst_ant[nb_ant][rxdata_size]:
+// the serving cell's own live buffer when source_ru_id < 0, or a spare RU's ring buffer when
+// source_ru_id >= 0
+static void copy_meas_source_samples(PHY_VARS_NR_UE *ue, const UE_nr_rxtx_proc_t *proc, int source_ru_id, uint32_t rxdata_size, c16_t *dst_ant)
+{
+  int nb_ant = ue->frame_parms.nb_antennas_rx;
+  if (source_ru_id < 0) {
+    uint32_t slot_offset = get_samples_slot_timestamp(&ue->frame_parms, proc->nr_slot_rx);
+    for (int i = 0; i < nb_ant; i++)
+      memcpy(dst_ant + i * rxdata_size, &ue->common_vars.rxdata[i][slot_offset], rxdata_size * sizeof(c16_t));
+    return;
+  }
+
+  c16_t **nbuf = nrue_get_neighbor_rxdata(source_ru_id);
+  uint32_t nbuf_size = nrue_get_neighbor_rxdata_size(source_ru_id);
+  uint32_t write_pos = nrue_get_neighbor_write_pos(source_ru_id);
+  int32_t ts_delta = nrue_get_ru_ts_delta(ue->rf_map.card, source_ru_id);
+  int32_t src = (int32_t)write_pos - (int32_t)rxdata_size + ts_delta;
+  uint32_t src_offset = ((src % (int32_t)nbuf_size) + (int32_t)nbuf_size) % nbuf_size;
+  uint32_t space_to_end = nbuf_size - src_offset;
+
+  for (int i = 0; i < nb_ant; i++) {
+    c16_t *dst = dst_ant + i * rxdata_size;
+    if (rxdata_size <= space_to_end) {
+      memcpy(dst, &nbuf[i][src_offset], rxdata_size * sizeof(c16_t));
+    } else {
+      memcpy(dst, &nbuf[i][src_offset], space_to_end * sizeof(c16_t));
+      memcpy(dst + space_to_end, &nbuf[i][0], (rxdata_size - space_to_end) * sizeof(c16_t));
+    }
+  }
+}
+
 static nr_meas_task_args_t *create_meas_task_args(const UE_nr_rxtx_proc_t *proc, PHY_VARS_NR_UE *ue)
 {
   NR_DL_FRAME_PARMS *fp = &ue->frame_parms;
-  // Extra headroom so that nr_slot_fep() can read all NR_N_SYMBOLS_SSB symbols
-  // when the PSS is detected at the very end of the samples_per_slot_wCP search window
-  uint32_t rxdata_size = fp->samples_per_slot_wCP
-                       + NR_N_SYMBOLS_SSB * (fp->ofdm_symbol_size + fp->nb_prefix_samples);
-  size_t total_size = sizeof(nr_meas_task_args_t) + fp->nb_antennas_rx * rxdata_size * sizeof(c16_t);
+
+  int source_ru_ids[1 + MAX_CARDS];
+  int num_sources = find_meas_sources(ue, source_ru_ids);
+
+  size_t total_size = sizeof(nr_meas_task_args_t) + num_sources * sizeof(nr_meas_source_t);
   nr_meas_task_args_t *args = malloc_or_fail(total_size);
   args->proc = *proc;
   args->ue = ue;
-  args->rxdata_size = rxdata_size;
   args->nb_ant = fp->nb_antennas_rx;
-  uint32_t slot_offset = get_samples_slot_timestamp(fp, proc->nr_slot_rx);
-  for (int i = 0; i < fp->nb_antennas_rx; i++)
-    memcpy(args->rxdata_ant + i * rxdata_size, &ue->common_vars.rxdata[i][slot_offset], rxdata_size * sizeof(c16_t));
+  args->num_sources = num_sources;
+
+  for (int s = 0; s < num_sources; s++) {
+    int source_ru_id = source_ru_ids[s];
+    NR_DL_FRAME_PARMS *source_fp = fp;
+    if (source_ru_id >= 0) {
+      int cell_id = nrue_get_ru(source_ru_id)->used_by_cell;
+      source_fp = nrue_get_cell_fp(cell_id);
+    }
+    // Extra headroom so that nr_slot_fep() can read all NR_N_SYMBOLS_SSB symbols when the PSS is
+    // detected at the very end of the samples_per_slot_wCP search window
+    uint32_t rxdata_size =
+        source_fp->samples_per_slot_wCP + NR_N_SYMBOLS_SSB * (source_fp->ofdm_symbol_size + source_fp->nb_prefix_samples);
+
+    args->sources[s].frame_parms = source_fp;
+    args->sources[s].ssb_arfcn = get_ssb_arfcn(source_fp);
+    args->sources[s].ru_id = source_ru_id >= 0 ? source_ru_id : ue->rf_map.card;
+    args->sources[s].rxdata_size = rxdata_size;
+    args->sources[s].rxdata_ant = malloc_or_fail(fp->nb_antennas_rx * rxdata_size * sizeof(c16_t));
+    copy_meas_source_samples(ue, proc, source_ru_id, rxdata_size, args->sources[s].rxdata_ant);
+  }
   return args;
 }
 
