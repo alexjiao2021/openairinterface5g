@@ -1845,10 +1845,19 @@ static void handle_pdu_session_modification_command(const nr_ue_nas_t *nas, uint
             set_qfi(rule->qfi, sm_header.pdu_session_id, instance);
             LOG_I(NAS, "PDU session %d: set default QFI to %d\n", sm_header.pdu_session_id, rule->qfi);
           }
+          nr_sdap_qos_rule_add(instance,
+                               sm_header.pdu_session_id,
+                               rule->id,
+                               rule->qfi,
+                               rule->precendence,
+                               rule->dqr,
+                               rule->packet_filters,
+                               rule->num_packet_filters);
           break;
 
         case ROC_DELETE_QOS_RULE:
           LOG_I(NAS, "PDU session %d: DELETE QoS rule %d\n", sm_header.pdu_session_id, rule->id);
+          nr_sdap_qos_rule_remove(instance, sm_header.pdu_session_id, rule->id);
           break;
 
         case ROC_MODIFY_QOS_RULE_ADD_PF:
@@ -1858,6 +1867,15 @@ static void handle_pdu_session_modification_command(const nr_ue_nas_t *nas, uint
                 rule->id,
                 rule->nb_pf,
                 rule->qfi);
+          nr_sdap_qos_rule_update(instance,
+                                  sm_header.pdu_session_id,
+                                  rule->id,
+                                  rule->qfi,
+                                  rule->precendence,
+                                  rule->dqr,
+                                  rule->packet_filters,
+                                  rule->num_packet_filters,
+                                  false);
           break;
 
         case ROC_MODIFY_QOS_RULE_REPLACE_PF:
@@ -1867,6 +1885,15 @@ static void handle_pdu_session_modification_command(const nr_ue_nas_t *nas, uint
                 rule->id,
                 rule->nb_pf,
                 rule->qfi);
+          nr_sdap_qos_rule_update(instance,
+                                  sm_header.pdu_session_id,
+                                  rule->id,
+                                  rule->qfi,
+                                  rule->precendence,
+                                  rule->dqr,
+                                  rule->packet_filters,
+                                  rule->num_packet_filters,
+                                  true);
           break;
 
         case ROC_MODIFY_QOS_RULE_DELETE_PF:
@@ -1876,6 +1903,7 @@ static void handle_pdu_session_modification_command(const nr_ue_nas_t *nas, uint
                 rule->id,
                 rule->num_pf_delete,
                 rule->qfi);
+          nr_sdap_qos_rule_delete_pf(instance, sm_header.pdu_session_id, rule->id, rule->pf_delete_ids, rule->num_pf_delete);
           break;
 
         case ROC_MODIFY_QOS_RULE_WITHOUT_PF:
@@ -1884,6 +1912,7 @@ static void handle_pdu_session_modification_command(const nr_ue_nas_t *nas, uint
                 sm_header.pdu_session_id,
                 rule->id,
                 rule->qfi);
+          nr_sdap_qos_rule_update(instance, sm_header.pdu_session_id, rule->id, rule->qfi, rule->precendence, rule->dqr, NULL, 0, false);
           break;
 
         default:

@@ -87,4 +87,13 @@ typedef struct packet_filter_decoded_s {
  */
 int decode_packet_filter_contents(uint8_t *buf, uint8_t length, packet_filter_decoded_t *pf);
 
+/**
+ * @brief Match an IP packet against a packet filter
+ * @param pf Packet filter to match against
+ * @param ip_pkt Pointer to IP packet (IPv4 or IPv6 header)
+ * @param pkt_len Length of the packet
+ * @return true if packet matches, false otherwise
+ */
+bool packet_filter_match(const packet_filter_decoded_t *pf, const uint8_t *ip_pkt, size_t pkt_len);
+
 #endif /* PACKET_FILTER_H_ */
