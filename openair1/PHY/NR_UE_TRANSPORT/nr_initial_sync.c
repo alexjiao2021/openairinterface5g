@@ -205,7 +205,11 @@ bool nr_search_ssb_common(nr_ssb_search_params_t *params)
   // Perform PSS search
   pss_search_t p_pss = (pss_search_t){.rxdata = params->rxdata,
                                       .nb_antennas_rx = params->nb_antennas_rx,
-                                      .rxdata_length = params->rxdata_size,
+                                      // rxdata_length is the number of search OFFSETS, not the
+                                      // number of valid samples: pss_search_time_nr() correlates
+                                      // ofdm_symbol_size samples at every offset, so the last one
+                                      // would run a symbol past the end.
+                                      .rxdata_length = params->rxdata_size - params->ofdm_symbol_size,
                                       .ofdm_symbol_size = params->ofdm_symbol_size,
                                       .nb_prefix_samples = params->nb_prefix_samples,
                                       .subcarrier_spacing = params->subcarrier_spacing,
