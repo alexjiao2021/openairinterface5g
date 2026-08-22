@@ -196,6 +196,7 @@ typedef struct val_init {
 
 typedef struct meas_s {
   uint16_t Nid_cell;
+  uint32_t ssb_freq;
   val_init_t ss_rsrp_dBm;
   val_init_t csi_rsrp_dBm;
 } meas_t;
