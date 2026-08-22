@@ -137,6 +137,7 @@ typedef struct NRRrcMacMeasDataInd_s {
   uint8_t gnb_index;
   int rsrp_dBm;
   uint16_t Nid_cell;
+  uint32_t ssb_freq;
   bool is_csi_meas;
   bool is_neighboring_cell;
 } NRRrcMacMeasDataInd;
