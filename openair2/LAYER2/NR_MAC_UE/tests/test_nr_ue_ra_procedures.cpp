@@ -133,6 +133,7 @@ bool check_csi_report_consistency(const NR_CSI_MeasConfig_t *meas)
 void nr_mac_rrc_meas_ind_ue(module_id_t module_id,
                             uint32_t gNB_index,
                             uint16_t Nid_cell,
+                            uint32_t ssb_freq,
                             bool csi_meas,
                             bool is_neighboring_cell,
                             int rsrp_dBm)
@@ -140,6 +141,7 @@ void nr_mac_rrc_meas_ind_ue(module_id_t module_id,
   UNUSED(module_id);
   UNUSED(gNB_index);
   UNUSED(Nid_cell);
+  UNUSED(ssb_freq);
   UNUSED(csi_meas);
   UNUSED(is_neighboring_cell);
   UNUSED(rsrp_dBm);
