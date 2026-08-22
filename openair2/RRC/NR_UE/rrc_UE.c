@@ -2960,7 +2960,7 @@ static void apply_ema(val_init_t *vi_rsrp_dBm, float filter_coeff_rsrp, int rsrp
   *meas_init = true;
 }
 
-void nr_ue_meas_filtering(rrcPerNB_t *rrc, meas_t *meas_cell, uint16_t Nid_cell, bool csi_meas, int rsrp_dBm)
+void nr_ue_meas_filtering(rrcPerNB_t *rrc, meas_t *meas_cell, uint16_t Nid_cell, uint32_t ssb_freq, bool csi_meas, int rsrp_dBm)
 {
   l3_measurements_t *l3_measurements = &rrc->l3_measurements;
 
@@ -2969,6 +2969,7 @@ void nr_ue_meas_filtering(rrcPerNB_t *rrc, meas_t *meas_cell, uint16_t Nid_cell,
     meas_cell->csi_rsrp_dBm.init = false;
   }
   meas_cell->Nid_cell = Nid_cell;
+  meas_cell->ssb_freq = ssb_freq;
 
   if (csi_meas)
     apply_ema(&meas_cell->csi_rsrp_dBm, l3_measurements->csi_RS_filter_coeff_rsrp, rsrp_dBm);
@@ -3270,6 +3271,7 @@ static void nr_rrc_handle_meas_indication(NR_UE_RRC_INST_t *rrc, NRRrcMacMeasDat
   if (meas_ind->is_neighboring_cell && meas_ind->rsrp_dBm == INT_MAX) {
     RRCLOG_D("[Nid_cell %i] Neighboring cell not detected. L3 measurements will be reset.\n", meas_ind->Nid_cell);
     meas_cell->Nid_cell = meas_ind->Nid_cell;
+    meas_cell->ssb_freq = meas_ind->ssb_freq;
     nr_ue_meas_reset(meas_cell, meas_ind->is_csi_meas);
   } else {
     RRCLOG_D("[%s][Nid_cell %i] Received %s measurements: RSRP = %i (dBm)\n",
@@ -3278,7 +3280,7 @@ static void nr_rrc_handle_meas_indication(NR_UE_RRC_INST_t *rrc, NRRrcMacMeasDat
              meas_ind->is_csi_meas ? "CSI meas" : "SSB meas",
              meas_ind->rsrp_dBm);
 
-    nr_ue_meas_filtering(rrcNB, meas_cell, meas_ind->Nid_cell, meas_ind->is_csi_meas, meas_ind->rsrp_dBm);
+    nr_ue_meas_filtering(rrcNB, meas_cell, meas_ind->Nid_cell, meas_ind->ssb_freq, meas_ind->is_csi_meas, meas_ind->rsrp_dBm);
     nr_ue_check_meas_report(rrc, meas_ind->gnb_index);
   }
 }
@@ -3832,6 +3834,23 @@ void nr_rrc_set_mac_queue(instance_t instance, notifiedFIFO_t *mac_input_nf)
   rrc->mac_input_nf = mac_input_nf;
 }
 
+// Frequency (SSB ARFCN or CSI-RS) that a given measId's measObject is configured for
+static uint32_t get_measid_freq(rrcPerNB_t *rrc, int meas_id)
+{
+  if (!rrc->MeasId[meas_id])
+    return 0;
+  NR_MeasObjectId_t measObjectId = rrc->MeasId[meas_id]->measObjectId;
+  if (!rrc->MeasObj[measObjectId]
+      || rrc->MeasObj[measObjectId]->measObject.present != NR_MeasObjectToAddMod__measObject_PR_measObjectNR)
+    return 0;
+  NR_MeasObjectNR_t *obj_nr = rrc->MeasObj[measObjectId]->measObject.choice.measObjectNR;
+  if (obj_nr->ssbFrequency)
+    return *obj_nr->ssbFrequency;
+  if (obj_nr->refFreqCSI_RS)
+    return *obj_nr->refFreqCSI_RS;
+  return 0;
+}
+
 void rrc_ue_generate_measurementReport(rrcPerNB_t *rrc, instance_t ue_id, int meas_id)
 {
   uint8_t buffer[NR_RRC_BUF_SIZE];
@@ -3842,16 +3861,19 @@ void rrc_ue_generate_measurementReport(rrcPerNB_t *rrc, instance_t ue_id, int me
   uint16_t neighbor_pcis[NUMBER_OF_NEIGHBORING_CELLS_MAX];
   int neighbor_rsrp_indexes[NUMBER_OF_NEIGHBORING_CELLS_MAX];
   int num_neighbors = 0;
+  uint32_t target_freq = get_measid_freq(rrc, meas_id);
 
   if (params->neighbor_cell_valid) {
     for (int i = 0; i < NUMBER_OF_NEIGHBORING_CELLS_MAX; i++) {
       bool is_valid = false;
 
-      // Check if this neighboring cell has valid measurements
-      if (params->rs_type == NR_NR_RS_Type_ssb) {
-        is_valid = l3m->neighboring_cell[i].ss_rsrp_dBm.init;
-      } else {
-        is_valid = l3m->neighboring_cell[i].csi_rsrp_dBm.init;
+      // Check if this neighboring cell has valid measurements on the same frequency as this measId's measObject
+      if (l3m->neighboring_cell[i].ssb_freq == target_freq) {
+        if (params->rs_type == NR_NR_RS_Type_ssb) {
+          is_valid = l3m->neighboring_cell[i].ss_rsrp_dBm.init;
+        } else {
+          is_valid = l3m->neighboring_cell[i].csi_rsrp_dBm.init;
+        }
       }
 
       if (is_valid) {

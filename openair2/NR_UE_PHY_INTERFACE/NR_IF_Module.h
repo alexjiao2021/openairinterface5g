@@ -228,12 +228,13 @@ typedef int (nr_ue_ul_indication_f)(nr_uplink_indication_t *ul_info);
 
 typedef void (nr_ue_slot_indication_f)(uint8_t mod_id, bool is_tx);
 
-typedef void (nr_ue_meas_ind_f)(module_id_t module_id,
-                                uint32_t gNB_index,
-                                uint16_t Nid_cell,
-                                bool csi_meas,
-                                bool is_neighboring_cell,
-                                int rsrp_dBm);
+typedef void(nr_ue_meas_ind_f)(module_id_t module_id,
+                               uint32_t gNB_index,
+                               uint16_t Nid_cell,
+                               uint32_t ssb_freq,
+                               bool csi_meas,
+                               bool is_neighboring_cell,
+                               int rsrp_dBm);
 
 /*
  * Generic type of an application-defined callback to return various
