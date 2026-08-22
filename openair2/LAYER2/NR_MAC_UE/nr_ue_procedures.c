@@ -1678,6 +1678,7 @@ void nr_ue_process_l1_measurements(NR_UE_MAC_INST_t *mac, frame_t frame, int slo
   nr_mac_rrc_meas_ind_ue(mac->ue_id,
                          l1_measurements->gNB_index,
                          l1_measurements->Nid_cell,
+                         l1_measurements->ssb_freq,
                          csi_meas,
                          l1_measurements->is_neighboring_cell,
                          l1_measurements->rsrp_dBm);
