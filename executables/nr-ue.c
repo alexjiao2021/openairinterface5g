@@ -486,6 +486,28 @@ static int handle_sync_req_from_mac(PHY_VARS_NR_UE *UE)
       fp->dl_CarrierFreq = dl_CarrierFreq;
       fp->ul_CarrierFreq = ul_CarrierFreq;
       init_symbol_rotation(fp);
+    } else if (UE->target_Nid_cell >= 0 && UE->target_Nid_cell != fp->Nid_cell) {
+      // Intra-frequency handover with different PCI
+      for (int ru_id = 0; ru_id < nrue_get_ru_count(); ru_id++) {
+        if (ru_id == UE->rf_map.card)
+          continue;
+        int cell_id = nrue_get_ru(ru_id)->used_by_cell;
+        if (cell_id < 0)
+          continue;
+        LOG_I(NR_PHY,
+              "[UE %d] Intra-freq HO: switching rf_map.card %d->%d for target PCI %d\n",
+              UE->Mod_id,
+              UE->rf_map.card,
+              ru_id,
+              UE->target_Nid_cell);
+        int old_cell_id = nrue_get_ru(UE->rf_map.card)->used_by_cell;
+        if (old_cell_id >= 0)
+          nrue_set_cell_used_by_ue(old_cell_id, -1);
+        nrue_set_cell_used_by_ue(cell_id, UE->Mod_id);
+        UE->rf_map.card = ru_id;
+        UE->target_Nid_cell = -1;
+        break;
+      }
     }
 
     int ssb_start_subcarrier = nr_get_ssb_start_sc(fp->numerology_index,
