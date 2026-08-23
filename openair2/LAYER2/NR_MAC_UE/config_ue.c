@@ -206,8 +206,12 @@ static void config_common_ue_sa(NR_UE_MAC_INST_t *mac, NR_ServingCellConfigCommo
   // SSB Table config
   cfg->ssb_table.ssb_offset_point_a = frequencyInfoDL->offsetToPointA;
   cfg->ssb_table.ssb_period = scc->ssb_PeriodicityServingCell;
-  cfg->ssb_table.ssb_subcarrier_offset = mac->ssb_subcarrier_offset;
   cfg->ssb_table.ssb_case = set_ssb_case(mac->numerology, mac->nr_band);
+  // During handover, dedicatedSIB1-Delivery does not have target cell's k_SSB (it's in MIB)
+  // so mac->ssb_subcarrier_offset is still source cell's, we should skip it and use the value
+  // derived from the target cell's absoluteFrequencySSB in reconfigurationWithSync
+  if (mac->state != UE_NOT_SYNC_RECONF)
+    cfg->ssb_table.ssb_subcarrier_offset = mac->ssb_subcarrier_offset;
 
   if (mac->frequency_range == FR1){
     cfg->ssb_table.ssb_mask_list[0].ssb_mask = ((uint32_t) scc->ssb_PositionsInBurst.inOneGroup.buf[0]) << 24;
