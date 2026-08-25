@@ -469,6 +469,8 @@ static void search_new_neighboring_cell(UE_nr_rxtx_proc_t *proc,
                                         c16_t **rxdata,
                                         uint32_t rxdata_size)
 {
+  pthread_mutex_lock(&ue->measurements.neighboring_cell_mutex);
+
   // Generate PSS time-domain sequences once for all neighbor cells
   __attribute__((aligned(32))) c16_t pssTime[NUMBER_PSS_SEQUENCE][frame_parms->ofdm_symbol_size];
   for (int nid2_idx = 0; nid2_idx < NUMBER_PSS_SEQUENCE; nid2_idx++) {
@@ -522,6 +524,8 @@ static void search_new_neighboring_cell(UE_nr_rxtx_proc_t *proc,
       handle_blind_search(ue->nrUE_config.meas_config.nr_neighboring_cell, neighbor_cell->ssb_freq);
     }
   }
+
+  pthread_mutex_unlock(&ue->measurements.neighboring_cell_mutex);
 }
 
 static void do_neighboring_cell_measurements(UE_nr_rxtx_proc_t *proc,
@@ -531,6 +535,8 @@ static void do_neighboring_cell_measurements(UE_nr_rxtx_proc_t *proc,
                                              int source_ru_id,
                                              c16_t **rxdata)
 {
+  pthread_mutex_lock(&ue->measurements.neighboring_cell_mutex);
+
   // Generate PSS time-domain sequences once for all neighbor cells
   __attribute__((aligned(32))) c16_t pssTime[NUMBER_PSS_SEQUENCE][frame_parms->ofdm_symbol_size];
   for (int nid2_idx = 0; nid2_idx < NUMBER_PSS_SEQUENCE; nid2_idx++) {
@@ -586,6 +592,8 @@ static void do_neighboring_cell_measurements(UE_nr_rxtx_proc_t *proc,
     // Send SS measurements to RRC directly
     send_neighbor_cell_meas(ue, proc, neighbor_cell->Nid_cell, neighbor_cell->ssb_freq, neighboring_cell_info->ssb_rsrp_dBm);
   }
+
+  pthread_mutex_unlock(&ue->measurements.neighboring_cell_mutex);
 }
 
 void nr_ue_meas_neighboring_cell(void *arg)
