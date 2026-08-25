@@ -154,6 +154,7 @@ typedef struct {
 
   /// Info about neighboring cells to perform the measurements
   neighboring_cell_info_t neighboring_cell_info[NUMBER_OF_NEIGHBORING_CELLS_MAX];
+  pthread_mutex_t neighboring_cell_mutex;
   _Atomic(bool) meas_request_pending;
   _Atomic(bool) search_new_cells_pending;
   int last_blind_slot;
