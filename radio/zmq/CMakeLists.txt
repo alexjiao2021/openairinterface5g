@@ -7,6 +7,7 @@ target_include_directories(zmq_imported PUBLIC ./)
 target_link_libraries(zmq_imported PUBLIC ${zmq_LIBRARIES} log_headers)
 
 target_include_directories(ring_buffer PUBLIC ./)
+add_subdirectory(channel_emulation)
 add_library(oai_zmqdevif SHARED zmq_radio.cpp)
 target_link_libraries(oai_zmqdevif PUBLIC ${zmq_LIBRARIES} ring_buffer log_headers zmq_imported)
 target_include_directories(oai_zmqdevif PUBLIC ${zmq_INCLUDE_DIRS})
