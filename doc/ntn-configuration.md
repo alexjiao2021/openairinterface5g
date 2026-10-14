@@ -204,7 +204,7 @@ sudo ./ran_build/build/nr-uesoftmodem -O ../targets/PROJECTS/GENERIC-NR-5GC/CONF
 ```
 
 
-### Interoperability testing with OCUDU gNB
+### GEO interoperability testing with OCUDU gNB
 > Follow the [OCUDU documentation](https://docs.ocudu.org/tutorials/ntn/) to build gNB and install the external GNU radio emulator
 
 1. GNU Radio Emulator
@@ -258,3 +258,77 @@ converted to ECEF via the standard WGS84 geodetic-to-ECEF formula:
 ```bash
 sudo ./nr-uesoftmodem -O ../targets/PROJECTS/GENERIC-NR-5GC/CONF/ue.conf --band 256 -C 2185000000 --CO -190000000 -r 25 --numerology 0 --ssb 60 --uecap_file ../targets/PROJECTS/GENERIC-NR-5GC/CONF/uecap_ports1.xml --device.name oai_zmqdevif --zmq.[0].tx_channels tcp://127.0.0.1:2101 --zmq.[0].rx_channels tcp://127.0.0.1:2100
 ```
+
+
+### LEO interoperability testing with OCUDU gNB
+
+OAI UE can be tested with OCUDU gNB using GNU Radio LEO channel emulation over ZMQ. Check OCUDU project for how to generate NTN configs from TLE data. Follow below steps:
+
+1. **Generate the GNU Radio files and startup metadata before starting the radio**:
+  ```bash
+  python3 tools/ntn/ntn_tle_profile_generator.py --duration 60 --step 0.01 \
+    --tle-file "$OCUDU_SCENARIO_DIR/tle_updated.txt" \
+    --starting-time-config "$OCUDU_SCENARIO_DIR/sat.yml" \
+    --ue-position-file "$OCUDU_SCENARIO_DIR/ue-position.cfg" \
+    --gateway-position-file "$OCUDU_SCENARIO_DIR/gw-position.cfg" \
+    --output-path /tmp
+  ```
+  `--tle-file` accepts a standard two- or three-line TLE file, use OCUDU generated `tle_updated.txt`. Use `--starting-time-config` with the matching `sat.yml` to read the
+  serving satellite epoch broadcast by OCUDU, and use the matching `ue-position.cfg` and
+  `gw-position.cfg` files for UE and Gateway position.
+
+  `--sat-type` supports `transparent` and `regenerative`. DL and UL frequencies default
+  to 2185 MHz and 1995 MHz. See `--help` for frequency overrides.
+  `--output-path` selects where to generate the delay/Doppler files for GNU Radio and JSON
+  file for launching the UE:
+  - `ntn_delay.txt`: absolute Unix seconds and one-way delay in seconds.
+  - `ntn_dl_doppler.txt`: absolute Unix seconds and negated DL Doppler in Hz.
+  - `ntn_ul_doppler.txt`: absolute Unix seconds and negated UL Doppler in Hz.
+
+  It also writes `ntn.json` with `start_unix_s`, `duration_s`,
+  `initial_dl_service_doppler_hz`, and `initial_time_drift_us_per_s`.
+  The startup Doppler is the physical service-link shift, not the negated
+  full-path correction value. Timing drift is calculated from the first two delay
+  samples. The clock initializer and UE launcher read this JSON.
+
+2. **Initialize the simulation clock and start OCUDU gNB**:
+  ```bash
+  sudo python3 tools/ntn/init_sim_clock.py /tmp/ntn.json
+  sudo env OAI_SIM_CLOCK_SHM=/oai_sim_clock \
+    LD_PRELOAD="$PWD/cmake_targets/ran_build/build/libsim_clock_shim.so" \
+    /path/to/ocudu_gnb ...
+  ```
+  The shim uses simulation time for realtime/TAI calls, leaving monotonic clocks unchanged.
+  TAI defaults to UTC + 37 seconds; override with `OAI_TAI_OFFSET` if needed.
+
+3. **Start the external channel emulator**:
+   Requires GNU Radio 3.10 with Qt and gr-satellites. The flowgraph is maintained
+   outside this repository. Generate the files first, then open your external graph:
+   ```bash
+   gnuradio-companion "$HOME/ntn/ntn_channel_emulator.grc"
+   ```
+   Set `profile_path` to where the JSON file lives and match `samp_rate` to both radios. Match their endpoints to this example:
+
+   | Block | Address | Emulator role |
+   |----------|---------|---------------|
+   | `dl_source` | `tcp://127.0.0.1:4556` | REQ source connects to gNB TX REP |
+   | `ul_sink` | `tcp://127.0.0.1:4557` | REP sink binds for gNB RX REQ |
+   | `ul_source` | `tcp://127.0.0.1:2101` | REQ source connects to UE TX REP |
+   | `dl_sink` | `tcp://127.0.0.1:2100` | REP sink binds for UE RX REQ |
+
+   For the flowgraph:
+   Delay/Doppler blocks use JSON `start_unix_s` and sample counts, not launch wall time.
+   Use Head blocks to stop at `duration_s * samp_rate` samples; stop the GUI afterwards,
+   as radio peers may wait when samples end.
+
+4. **Start the OAI UE**:
+  ```bash
+  python3 tools/ntn/launch_ntn_ue.py --metadata /tmp/ntn.json \
+    --ue-position-file "$OCUDU_SCENARIO_DIR/ue-position.cfg" --ue-config /path/to/nrue.conf \
+    -- ./nr-uesoftmodem ... \
+    --device.name oai_zmqdevif \
+    --zmq.[0].tx_channels tcp://127.0.0.1:2101 --zmq.[0].rx_channels tcp://127.0.0.1:2100
+  ```
+  The launcher reads the startup values from JSON and supplies `--initial-fo`,
+  `--ntn-initial-time-drift`, and `--zmq.[0].sim_clock_start_unix_s` before starting the UE.
+  With `--ue-position-file`, it also converts the OCUDU latitude/longitude/altitude to WGS-84 ECEF metres, atomically updates the `position0` block in `--ue-config`, and passes that configuration to the UE with `-O`.

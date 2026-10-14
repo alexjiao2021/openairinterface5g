@@ -38,3 +38,16 @@ sudo ./nr-uesoftmodem -r 106 --numerology 1 --band 78 -C 3619200000 --device.nam
 ```
 sudo ./nr-softmodem -O ../targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.106PRB.usrpb210.conf --gNBs.[0].min_rxtxtime 6 --device.name oai_zmqdevif --zmq.[0].tx_channels tcp://127.0.0.1:4556 --zmq.[0].rx_channels tcp://127.0.0.1:4557
 ```
+
+## Simulation clock
+
+`--zmq.[0].sim_clock_start_unix_s <Unix seconds>` enables UE RX clock publishing.
+Use the JSON `start_unix_s`: UTC Unix time of the first RX sample. Quote the value when supplied in a configuration file.
+Without this option, shared clock memory is untouched. `OAI_SIM_CLOCK_SHM` selects its
+name (default `/oai_sim_clock`).
+
+Before each blocking RX read, the driver publishes:
+```text
+start_unix_s + (next_rx_timestamp - initial_rx_timestamp) / sample_rate
+```
+TX and prefetch do not advance time; device restart resets it. Use only one publisher.
