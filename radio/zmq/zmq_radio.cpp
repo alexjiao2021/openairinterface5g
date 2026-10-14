@@ -41,15 +41,22 @@
 #include <zmq.h>
 #include "zmq_imported.h"
 #include "zmq_simd.h"
+#include "sim_clock_publisher.h"
 
 #define ZMQ_SECTION "zmq"
 #define ZMQ_TX_CHANNELS "tx_channels"
 #define ZMQ_RX_CHANNELS "rx_channels"
+#define ZMQ_SIM_CLOCK_START_UNIX_S "sim_clock_start_unix_s"
 
 #define ZMQ_PARAMS_DESC                                                                                                            \
   {                                                                                                                                \
       STRINGLISTPARAM(ZMQ_TX_CHANNELS, "list of zmq addresses represeting tx channels_\n", PARAMFLAG_MANDATORY, nullptr, nullptr), \
       STRINGLISTPARAM(ZMQ_RX_CHANNELS, "list of zmq addresses represeting rx channels_\n", PARAMFLAG_MANDATORY, nullptr, nullptr), \
+      STRINGPARAM(ZMQ_SIM_CLOCK_START_UNIX_S,                                                                                      \
+                  "Enable RX sample-clock publishing with this initial Unix time in seconds\n",                                    \
+                  0,                                                                                                               \
+                  nullptr,                                                                                                         \
+                  nullptr),                                                                                                        \
   };
 
 const size_t sample_size = sizeof(cf_t);
@@ -64,6 +71,7 @@ struct zmq_state_t {
   std::atomic<bool> poll_thread_running;
   bool stopped = false;
   double sample_rate;
+  std::unique_ptr<SimClockPublisher> sim_clock;
 };
 
 static void tx_poll_thread(zmq_tx_channel *chan, size_t i, std::atomic<bool> *poll_thread_running)
@@ -183,6 +191,8 @@ static int zmq_read(openair0_device_t *device, openair0_timestamp_t *ptimestamp,
               nbAnt,
               (int)s->rx_stream.channels_.size());
   uint64_t timestamp;
+  if (s->sim_clock)
+    s->sim_clock->publish(s->rx_stream.sample_count_);
   s->rx_stream.receive((c16_t **)samplesVoid, nsamps, &timestamp);
   *ptimestamp = timestamp;
   return nsamps;
@@ -238,6 +248,8 @@ static int zmq_start(openair0_device_t *device)
   zmq_state_t *s = static_cast<zmq_state_t *>(device->priv);
   s->rx_stream.start(s->sample_rate / 100);
   s->tx_stream.start(s->sample_rate / 100);
+  if (s->sim_clock)
+    s->sim_clock->start(s->rx_stream.sample_count_);
   for (size_t i = 0; i < s->rx_stream.channels_.size(); i++) {
     auto channel = s->rx_stream.channels_[i];
     // Send initial request to start data flow
@@ -294,10 +306,6 @@ static int zmq_write_init(openair0_device_t *device)
 
 extern "C" __attribute__((__visibility__("default"))) int device_init(openair0_device_t *device, openair0_config_t *openair0_cfg)
 {
-  auto *zmq_state = new zmq_state_t();
-  zmq_state->context = zmq_ctx_new();
-  AssertFatal(zmq_state->context != NULL, "zmq_ctx_new failed");
-
   LOG_I(HW, "[ZMQ] tx_antennas: %d, rx_antennas: %d\n", openair0_cfg->tx_num_channels, openair0_cfg->rx_num_channels);
   configmodule_interface_t *cfg = config_get_if();
   paramdef_t param_desc[] = ZMQ_PARAMS_DESC;
@@ -306,6 +314,22 @@ extern "C" __attribute__((__visibility__("default"))) int device_init(openair0_d
   std::string zmq_array_section = std::string(ZMQ_SECTION) + ".[" + std::to_string(ru_id) + "]";
   int ret = config_get(cfg, param_desc, sizeofArray(param_desc), zmq_array_section.c_str());
   AssertFatal(ret >= 0, "configuration couldn't be performed\n");
+  std::unique_ptr<SimClockPublisher> sim_clock;
+  const paramdef_t *start_time = gpd(param_desc, sizeofArray(param_desc), ZMQ_SIM_CLOCK_START_UNIX_S);
+  const char *value = start_time->strptr ? *start_time->strptr : nullptr;
+  if (value) {
+    char *end = nullptr;
+    errno = 0;
+    // Avoid the shared TYPE_DOUBLE command-line conversion to single precision.
+    const double start_unix_s = strtod(value, &end);
+    if (end == value || *end != '\0' || errno == ERANGE) {
+      LOG_E(HW, "[ZMQ] Invalid simulation clock start time: %s\n", value);
+      return -1;
+    }
+    sim_clock = SimClockPublisher::create(start_unix_s, openair0_cfg->sample_rate);
+    if (!sim_clock)
+      return -1;
+  }
   int num_configured_tx_channels = gpd(param_desc, sizeofArray(param_desc), ZMQ_TX_CHANNELS)->numelt;
   AssertFatal(num_configured_tx_channels == openair0_cfg->tx_num_channels,
               "Incorrect configuration: Number of zmq tx channels (%d) != number of configured tx channels (%d)\n",
@@ -318,6 +342,11 @@ extern "C" __attribute__((__visibility__("default"))) int device_init(openair0_d
               openair0_cfg->rx_num_channels);
   char **tx_channels = gpd(param_desc, sizeofArray(param_desc), ZMQ_TX_CHANNELS)->strlistptr;
   char **rx_channels = gpd(param_desc, sizeofArray(param_desc), ZMQ_RX_CHANNELS)->strlistptr;
+
+  auto *zmq_state = new zmq_state_t();
+  zmq_state->sim_clock = std::move(sim_clock);
+  zmq_state->context = zmq_ctx_new();
+  AssertFatal(zmq_state->context != NULL, "zmq_ctx_new failed");
 
   // Setup TX sockets (one per antenna)
   if (openair0_cfg->tx_num_channels > 0) {
